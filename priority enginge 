@@ -1,0 +1,177 @@
+
+"""Explainable municipal issue prioritization; Python 3.10+. No trained ML model."""
+from __future__ import annotations
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import Optional
+
+WEIGHTS = {'safety_risk': .35, 'damage_severity': .20, 'traffic_impact': .15,
+           'infrastructure_importance': .15, 'time_urgency': .10, 'citizen_reports': .05}
+LEVELS = ('CRITICAL', 'HIGH', 'MEDIUM', 'LOW')
+RISK_TYPES = ('physical_hazard', 'traffic_hazard', 'environmental_hazard',
+              'health_hazard', 'electrical_hazard', 'flood_hazard',
+              'accessibility_hazard', 'structural_hazard')
+
+# Each subcategory: (risk tags, baseline safety 0-100, review flag).
+# These are illustrative defaults, NOT verified risk assessments.
+TAXONOMY = {
+ 'pothole': {'department':'Road Maintenance','subcategories':{
+  'minor_pothole':(['traffic_hazard'],25,False), 'deep_pothole':(['traffic_hazard','physical_hazard'],65,False),
+  'large_pothole':(['traffic_hazard','physical_hazard'],70,False), 'exposed_road_base':(['traffic_hazard'],65,True)}},
+ 'road_crack': {'department':'Road Maintenance','subcategories':{
+  'hairline_crack':(['traffic_hazard'],15,False), 'longitudinal_crack':(['traffic_hazard'],30,False),
+  'transverse_crack':(['traffic_hazard'],30,False), 'alligator_cracking':(['traffic_hazard','structural_hazard'],55,True)}},
+ 'sidewalk_damage': {'department':'Road Maintenance','subcategories':{
+  'uneven_surface':(['physical_hazard','accessibility_hazard'],45,False),
+  'broken_pavement':(['physical_hazard'],40,False), 'missing_paving':(['physical_hazard','accessibility_hazard'],55,False),
+  'accessibility_obstruction':(['accessibility_hazard'],65,False)}},
+ 'broken_traffic_light': {'department':'Traffic Engineering','subcategories':{
+  'signal_off':(['traffic_hazard'],90,True), 'incorrect_signal':(['traffic_hazard'],98,True),
+  'physical_damage':(['traffic_hazard','electrical_hazard'],75,True),
+  'pedestrian_signal_failure':(['traffic_hazard','accessibility_hazard'],80,True)}},
+ 'damaged_road_sign': {'department':'Traffic Engineering','subcategories':{
+  'missing_sign':(['traffic_hazard'],65,True), 'unreadable_sign':(['traffic_hazard'],45,False),
+  'bent_sign':(['traffic_hazard','structural_hazard'],45,False),
+  'fallen_sign':(['traffic_hazard','physical_hazard'],70,True)}},
+ 'fallen_tree': {'department':'Parks Department','subcategories':{
+  'tree_blocking_road':(['traffic_hazard','physical_hazard'],85,True),
+  'tree_blocking_sidewalk':(['physical_hazard','accessibility_hazard'],70,True),
+  'tree_on_power_line':(['electrical_hazard','physical_hazard'],100,True),
+  'tree_on_property':(['structural_hazard','physical_hazard'],75,True)}},
+ 'fallen_branch': {'department':'Parks Department','subcategories':{
+  'small_branch':(['physical_hazard'],15,False), 'large_branch':(['physical_hazard'],55,False),
+  'branch_blocking_road':(['traffic_hazard','physical_hazard'],80,True),
+  'hanging_branch':(['physical_hazard'],85,True)}},
+ 'streetlight_failure': {'department':'Street Lighting','subcategories':{
+  'light_off':(['traffic_hazard'],30,False), 'multiple_lights_off':(['traffic_hazard'],55,False),
+  'flickering_light':(['traffic_hazard'],25,False),
+  'damaged_light_pole':(['electrical_hazard','structural_hazard'],90,True)}},
+ 'water_leak': {'department':'Water Utilities','subcategories':{
+  'minor_leak':(['flood_hazard'],25,False), 'major_leak':(['flood_hazard','structural_hazard'],70,True),
+  'road_flooding':(['flood_hazard','traffic_hazard'],80,True),
+  'suspected_pipe_burst':(['flood_hazard','structural_hazard'],85,True)}},
+ 'blocked_drain': {'department':'Drainage Services','subcategories':{
+  'leaves_blockage':(['flood_hazard'],20,False), 'trash_blockage':(['flood_hazard'],25,False),
+  'sediment_blockage':(['flood_hazard'],30,False),
+  'severe_flood_risk':(['flood_hazard','traffic_hazard'],85,True)}},
+ 'damaged_bench': {'department':'Public Spaces','subcategories':{
+  'cosmetic_damage':([],5,False), 'broken_seat':(['physical_hazard'],35,False),
+  'sharp_edges':(['physical_hazard'],70,True), 'unstable_structure':(['structural_hazard','physical_hazard'],75,True)}},
+ 'illegal_dumping': {'department':'Waste Management','subcategories':{
+  'general_waste':(['environmental_hazard'],20,False), 'bulky_waste':(['environmental_hazard'],25,False),
+  'electronic_waste':(['environmental_hazard'],45,False),
+  'chemical_waste':(['environmental_hazard','health_hazard'],85,True),
+  'sharp_hazardous_waste':(['physical_hazard','health_hazard'],80,True),
+  'biological_waste':(['health_hazard','environmental_hazard'],85,True),
+  'construction_waste':(['physical_hazard','environmental_hazard'],40,False),
+  'suspected_asbestos':(['health_hazard','environmental_hazard'],90,True)}}
+}
+
+@dataclass
+class Report:
+    id: int
+    category: str
+    subcategory: str
+    damage_severity: float
+    traffic_impact: float
+    infrastructure_importance: float
+    time_urgency: float
+    citizen_reports: float  # normalized 0-100, NOT a raw report count
+    confidence: float = 1.0
+    safety_risk: Optional[float] = None
+    risk_types: list[str] = field(default_factory=list)
+    critical_hazard_verified: bool = False
+    admin_priority: Optional[str] = None
+    admin_reason: Optional[str] = None
+    status: str = 'REPORTED'
+    audit_log: list[dict] = field(default_factory=list)
+
+
+def classify(report: Report) -> dict:
+    if report.category not in TAXONOMY:
+        return {'department':'Municipal Triage', 'risk_types':list(report.risk_types),
+                'baseline_safety':50, 'requires_review':True, 'unknown':True}
+    item = TAXONOMY[report.category]
+    if report.subcategory not in item['subcategories']:
+        return {'department':item['department'], 'risk_types':list(report.risk_types),
+                'baseline_safety':50, 'requires_review':True, 'unknown':True}
+    risks, baseline, review = item['subcategories'][report.subcategory]
+    unknown_risks = set(report.risk_types) - set(RISK_TYPES)
+    if unknown_risks:
+        raise ValueError(f'Unknown risk types: {sorted(unknown_risks)}')
+    return {'department':item['department'], 'risk_types':sorted(set(risks) | set(report.risk_types)),
+            'baseline_safety':baseline, 'requires_review':review, 'unknown':False}
+
+
+def score_report(report: Report) -> dict:
+    info = classify(report)
+    if not 0 <= report.confidence <= 1:
+        raise ValueError('confidence must be between 0 and 1')
+    safety = info['baseline_safety'] if report.safety_risk is None else report.safety_risk
+    features = {'safety_risk':safety, 'damage_severity':report.damage_severity,
+                'traffic_impact':report.traffic_impact,
+                'infrastructure_importance':report.infrastructure_importance,
+                'time_urgency':report.time_urgency, 'citizen_reports':report.citizen_reports}
+    for key, value in features.items():
+        if not 0 <= value <= 100:
+            raise ValueError(f'{key} must be between 0 and 100')
+    score = sum(features[k] * weight for k, weight in WEIGHTS.items())
+    if report.critical_hazard_verified:
+        score = max(score, 90)
+    score = round(score, 1)
+    ai_priority = ('CRITICAL' if score >= 85 else 'HIGH' if score >= 65
+                   else 'MEDIUM' if score >= 40 else 'LOW')
+    if report.admin_priority is not None and report.admin_priority not in LEVELS:
+        raise ValueError('Invalid administrative priority')
+    return {'id':report.id, 'category':report.category, 'subcategory':report.subcategory,
+            'department':info['department'], 'risk_types':info['risk_types'],
+            'priority_score':score, 'ai_priority':ai_priority,
+            'effective_priority':report.admin_priority or ai_priority,
+            'admin_reason':report.admin_reason, 'status':report.status,
+            'requires_human_review':info['requires_review'] or info['unknown'] or report.confidence < .75,
+            'critical_hazard_verified':report.critical_hazard_verified,
+            'classification_confidence':report.confidence}
+
+
+def set_admin_priority(report: Report, level: str, reason: str, actor: str) -> None:
+    """Call only after checking actor authorization in the application layer."""
+    if level not in LEVELS or not reason.strip() or not actor.strip():
+        raise ValueError('Valid level, reason and actor required')
+    previous = report.admin_priority
+    report.admin_priority, report.admin_reason = level, reason
+    report.audit_log.append({'timestamp':datetime.now(timezone.utc).isoformat(),
+                             'actor':actor, 'previous':previous, 'new':level, 'reason':reason})
+
+
+def rank_reports(reports: list[Report]) -> list[dict]:
+    order = {level:i for i,level in enumerate(LEVELS)}
+    results = [score_report(r) for r in reports if r.status != 'COMPLETED']
+    return sorted(results, key=lambda r:(order[r['effective_priority']],
+                                         -r['priority_score'], r['id']))
+
+
+def department_lists(reports: list[Report]) -> dict[str, list[dict]]:
+    result = {}
+    for task in rank_reports(reports):
+        result.setdefault(task['department'], []).append(task)
+    return result
+
+
+if __name__ == '__main__':
+    reports = [
+        Report(101,'broken_traffic_light','signal_off',95,90,90,95,60,confidence=.93),
+        Report(102,'pothole','deep_pothole',80,70,80,65,40,confidence=.96),
+        Report(103,'illegal_dumping','chemical_waste',70,20,50,80,30,confidence=.64),
+        Report(104,'fallen_branch','small_branch',25,10,30,20,10),
+        Report(105,'damaged_bench','cosmetic_damage',20,5,20,15,10),
+    ]
+    set_admin_priority(reports[1], 'MEDIUM', 'Combine with planned roadworks', 'city_admin_demo')
+    print('=== CITY PRIORITY LIST ===')
+    for task in rank_reports(reports):
+        print(f"#{task['id']} {task['category']}/{task['subcategory']} "
+              f"AI={task['ai_priority']} Effective={task['effective_priority']} "
+              f"Score={task['priority_score']} Department={task['department']} "
+              f"Review={task['requires_human_review']}")
+    print('\n=== DEPARTMENT TASK LISTS ===')
+    for department, tasks in department_lists(reports).items():
+        print(department, [task['id'] for task in tasks])
